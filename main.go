@@ -1,152 +1,169 @@
 package main
 
 import (
-	"encoding/json"
-	"io/ioutil"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+
+	"github.com/algorand/go-algorand-sdk/client/kmd"
 
 	"github.com/algorand/go-algorand-sdk/encoding/msgpack"
+
+	"github.com/algorand/go-algorand-sdk/client/algod"
 
 	"github.com/gorilla/mux"
 )
 
 var (
-	Port               = "5000"
-	fisherAddr         = "fisherman"
-	CurrentStock Stock = map[string][]FishType{
-		fisherAddr: {
-			{
-				Species: "Tuna",
-				Price:   50,
-				Image:   "ABC",
-				Fishes: []string{
-					"1",
-					"2",
-					"3",
-				},
-			},
-			{
-				Species: "Cod",
-				Price:   200,
-				Image:   "DEF",
-				Fishes: []string{
-					"4",
-					"5",
-					"6",
-					"7",
-					"8",
-				},
-			},
-		},
-	}
+	Port                     = "5000"
+	algodAddress             = "http://localhost:8080"
+	algodToken               = "3cf8a164de7fdd16dd10948721911cadb5fcea87ba1a0523c0c4147613c2f3cc"
+	kmdAddress               = "http://localhost:7833"
+	kmdToken                 = "2d517e218cb9773ce564b30c089e5315e4e4281f5b58fc62d8fa04ed2e007299"
+	firstRound        uint64 = 1155000
+	lastRound         uint64 = 1155500
+	fisherAddr               = "fisherman"
+	walletPassword           = "abcd"
+	walletName               = "fisherman"
+	walletID                 = "36336f80ec1ac2b20fe5bf6fb4623bc8"
+	walletHandleToken        = ""
+	CurrentStock      Stock  = map[string][]FishType{}
 )
 
 func main() {
-
-	currentStockBlob := []byte(msgpack.Encode(Note{
-		Type:     NoteAddStock,
-		AddStock: CurrentStock,
-	}))
-
-	log.Print(currentStockBlob)
-
-	var note Note
-	err := msgpack.Decode(currentStockBlob, &note)
-	if err != nil {
-		log.Print("ERROR:" + err.Error())
-		return
-	}
-
-	log.Printf("%#v", note)
-
 	r := mux.NewRouter()
 
 	r.HandleFunc("/add", AddHarvestHandler).Methods("POST")
 	r.HandleFunc("/sell", SellHandler).Methods("POST")
+	r.HandleFunc("/stock", StockHandler).Methods("GET")
 
+	r.Methods("OPTIONS").HandlerFunc(
+		func(rw http.ResponseWriter, req *http.Request) {
+			rw.Header().Set("Access-Control-Allow-Origin", "*")
+			rw.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+			rw.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+		})
 	http.Handle("/", r)
+
+	kmdClient, err := kmd.MakeClient(kmdAddress, kmdToken)
+	if err != nil {
+		return
+	}
+
+	// Create the wallet, if it doesn't already exist
+	/*cwResponse, err := kmdClient.CreateWallet(walletName, walletPassword, kmd.DefaultWalletDriver, types.MasterDerivationKey{})
+	if err != nil {
+		fmt.Printf("error creating wallet: %s\n", err)
+		return
+	}
+
+	// We need the wallet ID in order to get a wallet handle, so we can add accounts
+	walletID = cwResponse.Wallet.ID
+	fmt.Printf("Created wallet '%s' with ID: %s\n", cwResponse.Wallet.Name, walletID)*/
+
+	// Get a wallet handle. The wallet handle is used for things like signing transactions
+	// and creating accounts. Wallet handles do expire, but they can be renewed
+	initResponse, err := kmdClient.InitWalletHandle(walletID, walletPassword)
+	if err != nil {
+		fmt.Printf("Error initializing wallet handle: %s\n", err)
+		return
+	}
+
+	// Extract the wallet handle
+	walletHandleToken = initResponse.WalletHandleToken
+
+	// Generate a new address from the wallet handle
+	genResponse, err := kmdClient.GenerateKey(walletHandleToken)
+	if err != nil {
+		fmt.Printf("Error generating key: %s\n", err)
+		return
+	}
+	fmt.Printf("Generated address %s\n", genResponse.Address)
+
+	// Extract the wallet address
+	fisherAddr = genResponse.Address
+
+	updateStock()
+
 	log.Fatal(http.ListenAndServe(":"+Port, nil))
 }
 
-// AddHarvestHandler handles adding harvest for fisherman
-func AddHarvestHandler(rw http.ResponseWriter, req *http.Request) {
-	body, err := ioutil.ReadAll(req.Body)
+func updateStock() {
+
+	restClient, err := algod.MakeClient(algodAddress, algodToken)
 	if err != nil {
-		log.Print("ERROR: " + err.Error())
-		rw.WriteHeader(http.StatusBadRequest)
-		return
+		log.Print(os.Stderr, "error making algod client: %v \n", err)
+		os.Exit(1)
 	}
 
-	var fishes FishType
-	err = json.Unmarshal(body, &fishes)
-	if err != nil {
-		log.Print("ERROR: " + err.Error())
-		rw.WriteHeader(http.StatusBadRequest)
-		return
+	//ticker := time.NewTicker(5 * time.Second)
+	//for {
+	//	select {
+	//	case <-ticker.C:
+	curRound := firstRound
+	finalRound := lastRound
+	if curRound > finalRound {
+		log.Print("first round %d is after last round %d, exiting\n", curRound, finalRound)
+		os.Exit(1)
 	}
 
-	addStock := Stock{
-		fisherAddr: {
-			fishes,
-		},
-	}
+	CurrentStock = map[string][]FishType{}
+	for curRound <= finalRound {
+		txns, err := restClient.TransactionsByAddr(fisherAddr, curRound, curRound)
+		if err != nil {
 
-	/*found := false
-	for i := range CurrentStock[fisherAddr] {
-		if CurrentStock[fisherAddr][i].Species == fishes.Species &&
-			CurrentStock[fisherAddr][i].Price == fishes.Price {
-			found = true
-			CurrentStock[fisherAddr][i].Fishes = append(CurrentStock[fisherAddr][i].Fishes, fishes.Fishes...)
 		}
+
+		for _, txn := range txns.Transactions {
+			if txn.ConfirmedRound != curRound {
+				log.Printf("Confirmed round mismatch: found a txn claiming to be confirmed in round %d, in block for round %d", txn.ConfirmedRound, curRound)
+				os.Exit(1)
+			}
+
+			var note Note
+			err = msgpack.Decode(txn.Note, &note)
+			if err != nil {
+				break
+			}
+
+			switch note.Type {
+			case NoteAddStock:
+				for addr := range note.AddStock {
+					if _, ok := CurrentStock[addr]; ok {
+						for j := range note.AddStock[addr] {
+							found := false
+							for i := range CurrentStock[addr] {
+								if CurrentStock[addr][i].Species == note.AddStock[addr][j].Species {
+									found = true
+									CurrentStock[fisherAddr][i].Amount += note.AddStock[addr][j].Amount
+								}
+							}
+							if !found {
+								CurrentStock[addr] = append(CurrentStock[addr], note.AddStock[addr]...)
+							}
+						}
+					} else {
+						CurrentStock[addr] = note.AddStock[addr]
+					}
+				}
+			case NoteSell:
+				for addr := range note.SellStock {
+					for j := range note.SellStock[addr] {
+						for i := range CurrentStock[fisherAddr] {
+							if CurrentStock[fisherAddr][i].Species == note.SellStock[addr][j].Species {
+								CurrentStock[fisherAddr][i].Amount -= note.SellStock[addr][j].Amount
+							}
+						}
+					}
+				}
+			default:
+				continue
+			}
+
+			//	}
+		}
+		curRound++
 	}
-
-	if !found {
-		CurrentStock[fisherAddr] = append(CurrentStock[fisherAddr], fishes)
-	}
-
-	currentStockJSON, err := json.Marshal(CurrentStock)
-	if err != nil {
-		log.Print("ERROR: " + err.Error())
-		rw.WriteHeader(http.StatusInternalServerError)
-		return
-	}*/
-
-	addStockBlob := []byte(msgpack.Encode(Note{
-		Type:     NoteAddStock,
-		AddStock: addStock,
-	}))
-
-	//rw.Header().Set("Content-Type", "application/json")
-	//rw.Write(currentStockJSON)
-
-	log.Print(addStockBlob)
-	rw.Write(addStockBlob)
-}
-
-// SellHandler handles selling fish to someone else
-// it generates and returns a QR code for the multisig transaction
-func SellHandler(rw http.ResponseWriter, req *http.Request) {
-	body, err := ioutil.ReadAll(req.Body)
-	if err != nil {
-		log.Print("ERROR:" + err.Error())
-		rw.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	var sellStock Stock
-	err = json.Unmarshal(body, &sellStock)
-	if err != nil {
-		log.Print("ERROR: " + err.Error())
-		rw.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	sellStockBlob := []byte(msgpack.Encode(Note{
-		Type:      NoteSell,
-		SellStock: sellStock,
-	}))
-
-	log.Print(sellStockBlob)
-	rw.Write(sellStockBlob)
+	log.Print("stock collected")
 }
